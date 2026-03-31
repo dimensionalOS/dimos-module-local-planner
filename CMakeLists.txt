@@ -20,7 +20,7 @@ find_package(PCL 1.8 REQUIRED COMPONENTS common filters kdtree)
 add_definitions(-DUSE_PCL)
 
 if(NOT DEFINED SMARTNAV_COMMON_DIR)
-  set(SMARTNAV_COMMON_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../common)
+  set(SMARTNAV_COMMON_DIR ${CMAKE_CURRENT_SOURCE_DIR}/common)
 endif()
 
 add_executable(local_planner main.cpp)
