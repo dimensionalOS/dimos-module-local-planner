@@ -230,6 +230,10 @@ static float joySpeed = 0;
 static float joySpeedRaw = 0;
 static float joyDir = 0;
 
+// Hysteresis: remember last selected group to avoid oscillation
+static int lastSelectedFullGroupID = -1;
+static double groupHysteresis = 0.50;  // 50% bonus to previous selection
+
 // ---------------------------------------------------------------------------
 // Path data constants
 // ---------------------------------------------------------------------------
@@ -442,6 +446,7 @@ public:
         goalReached = false;
         goalX = goal->point.x;
         goalY = goal->point.y;
+        lastSelectedFullGroupID = -1;  // Reset hysteresis on new goal
     }
 };
 
@@ -999,7 +1004,19 @@ int main(int argc, char** argv) {
                             if (rotDir < 18) rotDirW = fabs(fabs(rotDir - 9) + 1);
                             else rotDirW = fabs(fabs(rotDir - 27) + 1);
                             float groupDirW = 4 - fabs(pathList[i % pathNum] - 3);
-                            float score = (1 - sqrt(sqrt(dirWeight * dirDiff))) * rotDirW * rotDirW * rotDirW * rotDirW;
+                            // Additional angular proximity weight: prefer rotDir
+                            // closest to joyDir to prevent backward oscillation.
+                            // Only apply strong weighting when going backward
+                            // (|joyDir| > 90°) to avoid penalizing forward maneuvers.
+                            float rotDeg = 10.0f * rotDir - 180.0f;
+                            float joyAngDiff = fabs(joyDir - rotDeg);
+                            if (joyAngDiff > 180.0f) joyAngDiff = 360.0f - joyAngDiff;
+                            float joyDirW = 1.0f;
+                            if (fabs(joyDir) > 90.0f) {
+                                // Backward: tight Gaussian (sigma=12 deg)
+                                joyDirW = exp(-joyAngDiff * joyAngDiff / (2.0f * 12.0f * 12.0f));
+                            }
+                            float score = (1 - sqrt(sqrt(dirWeight * dirDiff))) * rotDirW * rotDirW * rotDirW * rotDirW * joyDirW;
                             if (relativeGoalDis < omniDirGoalThre) {
                                 score = (1 - sqrt(sqrt(dirWeight * dirDiff))) * groupDirW * groupDirW;
                             }
@@ -1011,7 +1028,7 @@ int main(int argc, char** argv) {
                         }
                     }
 
-                    // Select best group
+                    // Select best group (with hysteresis to prevent oscillation)
                     int selectedGroupID = -1;
                     if (preSelectedGroupID >= 0) {
                         selectedGroupID = preSelectedGroupID;
@@ -1022,10 +1039,15 @@ int main(int argc, char** argv) {
                             float rotAng = (10.0f * rotDir - 180.0f) * (float)PI / 180.0f;
                             float rotDeg = 10.0f * rotDir;
                             if (rotDeg > 180.0f) rotDeg -= 360.0f;
-                            if (maxScore < clearPathPerGroupScore[i] &&
+                            float score = clearPathPerGroupScore[i];
+                            // Hysteresis: give bonus to previously selected group
+                            if (lastSelectedFullGroupID >= 0 && i == lastSelectedFullGroupID) {
+                                score *= (1.0f + (float)groupHysteresis);
+                            }
+                            if (maxScore < score &&
                                 ((rotAng * 180.0f / (float)PI > minObsAngCW && rotAng * 180.0f / (float)PI < minObsAngCCW) ||
                                  (rotDeg > minObsAngCW && rotDeg < minObsAngCCW && twoWayDrive) || !checkRotObstacle)) {
-                                maxScore = clearPathPerGroupScore[i];
+                                maxScore = score;
                                 selectedGroupID = i;
                             }
                         }
@@ -1045,6 +1067,7 @@ int main(int argc, char** argv) {
 
                     // Build and publish path from selected group
                     if (selectedGroupID >= 0) {
+                        lastSelectedFullGroupID = selectedGroupID;
                         int rotDir = int(selectedGroupID / groupNum);
                         float rotAng = (10.0f * rotDir - 180.0f) * (float)PI / 180.0f;
 
