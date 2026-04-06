@@ -8,7 +8,6 @@
 // Inputs (LCM subscribe):
 //   registered_scan (PointCloud2) - obstacle point cloud
 //   odometry        (Odometry)    - vehicle pose
-//   joy_cmd         (Twist)       - joystick/teleop command
 //   way_point       (PointStamped)- goal waypoint
 //
 // Output (LCM publish):
@@ -33,13 +32,19 @@
 #include "dimos_native_module.hpp"
 #include "point_cloud_utils.hpp"
 
+// ---------------------------------------------------------------------------
+// Debug logging (enabled at runtime via DIMOS_DEBUG=1)
+// ---------------------------------------------------------------------------
+static bool dimosDebug = false;
+#define DBG(...) do { if (dimosDebug) { printf("[local_planner][DEBUG] " __VA_ARGS__); fflush(stdout); } } while (0)
+#define DBG_EVERY(N, ...) do { if (dimosDebug) { static int _c=0; if ((++_c % (N)) == 0) { printf("[local_planner][DEBUG] " __VA_ARGS__); fflush(stdout); } } } while (0)
+
 // dimos-lcm message types
 #include "sensor_msgs/PointCloud2.hpp"
 #include "nav_msgs/Odometry.hpp"
 #include "nav_msgs/Path.hpp"
 #include "geometry_msgs/PointStamped.hpp"
 #include "geometry_msgs/PoseStamped.hpp"
-#include "geometry_msgs/Twist.hpp"
 
 #ifdef USE_PCL
 #include <pcl/filters/voxel_grid.h>
@@ -209,8 +214,6 @@ static bool pathRangeBySpeed = true;
 static bool pathCropByGoal = true;
 static bool autonomyMode = false;
 static double autonomySpeed = 1.0;
-static double joyToSpeedDelay = 2.0;
-static double joyToCheckObstacleDelay = 5.0;
 static double freezeAng = 90.0;
 static double freezeTime = 2.0;
 static double freezeStartTime = 0;
@@ -226,8 +229,10 @@ static double goalYaw = 0;
 static bool hasGoalYaw = false;
 static double goalYawThreshold = 0.15;
 
+// joySpeed/joyDir are legacy names from the upstream joystick planner; they
+// now represent the desired forward-speed fraction and goal-bearing (deg)
+// derived from autonomyMode + the active way_point.
 static float joySpeed = 0;
-static float joySpeedRaw = 0;
 static float joyDir = 0;
 
 // ---------------------------------------------------------------------------
@@ -280,7 +285,6 @@ static bool newLaserCloud = false;
 static bool newTerrainCloud = false;
 
 static double odomTime = 0;
-static double joyTime = 0;
 
 static float vehicleRoll = 0, vehiclePitch = 0, vehicleYaw = 0;
 static float vehicleX = 0, vehicleY = 0, vehicleZ = 0;
@@ -293,7 +297,6 @@ static std::mutex stateMtx;
 // ---------------------------------------------------------------------------
 static string topicRegisteredScan;
 static string topicOdometry;
-static string topicJoyCmd;
 static string topicWayPoint;
 static string topicPath;
 
@@ -332,6 +335,8 @@ public:
         vehicleX = (float)(odom->pose.pose.position.x - cos(yaw) * sensorOffsetX + sin(yaw) * sensorOffsetY);
         vehicleY = (float)(odom->pose.pose.position.y - sin(yaw) * sensorOffsetX - cos(yaw) * sensorOffsetY);
         vehicleZ = (float)odom->pose.pose.position.z;
+        DBG_EVERY(50, "odom #%d: pose=(%.2f,%.2f,%.2f) yaw=%.2f t=%.3f\n",
+                  _c, vehicleX, vehicleY, vehicleZ, vehicleYaw, odomTime);
     }
 
     // Registered scan (laser cloud) handler
@@ -367,6 +372,9 @@ public:
         voxelGridFilter(laserCloudCrop, laserCloudDwz, (float)laserVoxelSize);
 
         newLaserCloud = true;
+        DBG_EVERY(10, "laser_scan #%d: raw=%d cropped=%d downsampled=%d\n",
+                  _c, (int)laserCloud.points.size(), (int)laserCloudCrop.points.size(),
+                  (int)laserCloudDwz.points.size());
     }
 
     // Terrain cloud handler (used when useTerrainAnalysis == true)
@@ -401,37 +409,9 @@ public:
         voxelGridFilter(terrainCloudCrop, terrainCloudDwz, (float)terrainVoxelSize);
 
         newTerrainCloud = true;
-    }
-
-    // Joy command handler -- uses Twist (linear.x = forward speed, angular.z = direction)
-    // In the dimos pattern the joystick is mapped to a Twist before reaching this node.
-    void joyCmdHandler(const lcm::ReceiveBuffer* /*rbuf*/,
-                       const std::string& /*channel*/,
-                       const geometry_msgs::Twist* twist) {
-        std::lock_guard<std::mutex> lk(stateMtx);
-        joyTime = wallTime();
-
-        // Map Twist to speed/direction: linear.x = forward, linear.y = lateral
-        float fwd = (float)twist->linear.x;
-        float lat = (float)twist->linear.y;
-        joySpeedRaw = sqrt(fwd * fwd + lat * lat);
-        joySpeed = joySpeedRaw;
-        if (joySpeed > 1.0f) joySpeed = 1.0f;
-        if (fwd == 0) joySpeed = 0;
-
-        if (joySpeed > 0) {
-            joyDir = atan2(lat, fwd) * 180.0f / (float)PI;
-            if (fwd < 0) joyDir *= -1;
-        }
-
-        if (fwd < 0 && !twoWayDrive) joySpeed = 0;
-
-        // angular.z > 0 => autonomy mode toggle (convention)
-        if (twist->angular.z > 0.5) {
-            autonomyMode = true;
-        } else if (twist->angular.z < -0.5) {
-            autonomyMode = false;
-        }
+        DBG_EVERY(10, "terrain_map #%d: raw=%d obstacles=%d downsampled=%d\n",
+                  _c, (int)terrainCloud.points.size(), (int)terrainCloudCrop.points.size(),
+                  (int)terrainCloudDwz.points.size());
     }
 
     // Waypoint goal handler
@@ -439,9 +419,14 @@ public:
                      const std::string& /*channel*/,
                      const geometry_msgs::PointStamped* goal) {
         std::lock_guard<std::mutex> lk(stateMtx);
+        double prevX = goalX, prevY = goalY;
+        bool wasReached = goalReached;
         goalReached = false;
         goalX = goal->point.x;
         goalY = goal->point.y;
+        printf("[local_planner] way_point received: goal=(%.2f, %.2f) prev=(%.2f, %.2f) wasReached=%d autonomyMode=%d\n",
+               goalX, goalY, prevX, prevY, (int)wasReached, (int)autonomyMode);
+        fflush(stdout);
     }
 };
 
@@ -594,6 +579,12 @@ static void readCorrespondences() {
 // Main
 // ---------------------------------------------------------------------------
 int main(int argc, char** argv) {
+    // Enable verbose debug logging when DIMOS_DEBUG env var is set to a
+    // non-empty, non-zero value.
+    if (const char* dbg = std::getenv("DIMOS_DEBUG")) {
+        dimosDebug = (dbg[0] != '\0' && std::string(dbg) != "0");
+    }
+
     // -----------------------------------------------------------------------
     // Parse CLI arguments via dimos NativeModule
     // -----------------------------------------------------------------------
@@ -635,8 +626,6 @@ int main(int argc, char** argv) {
     pathCropByGoal    = mod.arg_bool("pathCropByGoal", true);
     autonomyMode      = mod.arg_bool("autonomyMode", false);
     autonomySpeed     = mod.arg_float("autonomySpeed", 1.0f);
-    joyToSpeedDelay   = mod.arg_float("joyToSpeedDelay", 2.0f);
-    joyToCheckObstacleDelay = mod.arg_float("joyToCheckObstacleDelay", 5.0f);
     freezeAng         = mod.arg_float("freezeAng", 90.0f);
     freezeTime        = mod.arg_float("freezeTime", 2.0f);
     omniDirGoalThre   = mod.arg_float("omniDirGoalThre", 1.0f);
@@ -650,7 +639,6 @@ int main(int argc, char** argv) {
     // Resolve LCM topic channel names from NativeModule port arguments
     topicRegisteredScan = mod.topic("registered_scan");
     topicOdometry       = mod.topic("odometry");
-    topicJoyCmd         = mod.topic("joy_cmd");
     topicWayPoint       = mod.topic("way_point");
     topicPath           = mod.topic("path");
 
@@ -698,6 +686,16 @@ int main(int argc, char** argv) {
     readCorrespondences();
 
     printf("[local_planner] Initialization complete.\n");
+    printf("[local_planner] LOCAL BUILD from ./repo  DIMOS_DEBUG=%d\n", (int)dimosDebug);
+    printf("[local_planner] config: autonomyMode=%d autonomySpeed=%.2f maxSpeed=%.2f "
+           "useTerrainAnalysis=%d goalReachedThreshold=%.2f goalClearRange=%.2f "
+           "twoWayDrive=%d checkObstacle=%d obstacleHeightThre=%.2f\n",
+           (int)autonomyMode, autonomySpeed, maxSpeed, (int)useTerrainAnalysis,
+           goalReachedThreshold, goalClearRange,
+           (int)twoWayDrive, (int)checkObstacle, obstacleHeightThre);
+    printf("[local_planner] topics: odom=%s scan=%s way_point=%s terrain_map=%s path(out)=%s\n",
+           topicOdometry.c_str(), topicRegisteredScan.c_str(), topicWayPoint.c_str(),
+           topicTerrainMap.c_str(), topicPath.c_str());
     fflush(stdout);
 
     // -----------------------------------------------------------------------
@@ -707,7 +705,6 @@ int main(int argc, char** argv) {
 
     lcm.subscribe(topicOdometry, &Handlers::odometryHandler, &handlers);
     lcm.subscribe(topicRegisteredScan, &Handlers::laserCloudHandler, &handlers);
-    lcm.subscribe(topicJoyCmd, &Handlers::joyCmdHandler, &handlers);
     lcm.subscribe(topicWayPoint, &Handlers::goalHandler, &handlers);
 
     if (!topicTerrainMap.empty()) {
@@ -837,6 +834,9 @@ int main(int argc, char** argv) {
 
                     if (positionReached && orientationReached && !goalReached) {
                         goalReached = true;
+                        printf("[local_planner] GOAL REACHED at vehicle=(%.2f, %.2f) goal=(%.2f, %.2f) dis=%.2f\n",
+                               vehicleX, vehicleY, goalX, goalY, relativeGoalDis);
+                        fflush(stdout);
                     }
 
                     if (goalReached) {
@@ -856,10 +856,15 @@ int main(int argc, char** argv) {
                         if (fabs(joyDir) > freezeAng && freezeStatus == 0) {
                             freezeStartTime = odomTime;
                             freezeStatus = 1;
+                            DBG("freeze 0->1 (goal behind, |joyDir|=%.1f > %.1f)\n",
+                                fabs(joyDir), freezeAng);
                         } else if (odomTime - freezeStartTime > freezeTime && freezeStatus == 1) {
                             freezeStatus = 2;
+                            DBG("freeze 1->2 (held for %.2fs)\n", odomTime - freezeStartTime);
                         } else if (fabs(joyDir) <= freezeAng && freezeStatus == 2) {
                             freezeStatus = 0;
+                            DBG("freeze 2->0 (|joyDir|=%.1f back within %.1f)\n",
+                                fabs(joyDir), freezeAng);
                         }
 
                         if (!twoWayDrive) {
@@ -882,6 +887,16 @@ int main(int argc, char** argv) {
                     joyDir = 0;
                 }
 
+                // --- Throttled status log (once per second at 100Hz loop) ---
+                DBG_EVERY(100, "tick autonomy=%d goalReached=%d "
+                               "vehicle=(%.2f,%.2f,yaw=%.2f) goal=(%.2f,%.2f) "
+                               "relDis=%.2f joyDir=%.1f joySpeed=%.2f freezeStatus=%d "
+                               "obstaclePts=%d\n",
+                          (int)autonomyMode, (int)goalReached,
+                          vehicleX, vehicleY, vehicleYaw, goalX, goalY,
+                          relativeGoalDis, joyDir, joySpeed, freezeStatus,
+                          (int)plannerCloudCrop.points.size());
+
                 // ---------------------------------------------------------
                 // Path evaluation -- core DWA-like algorithm
                 // ---------------------------------------------------------
@@ -890,7 +905,14 @@ int main(int argc, char** argv) {
                 if (pathScaleBySpeed) pathScale = defPathScale * joySpeed;
                 if (pathScale < minPathScale) pathScale = minPathScale;
 
+                DBG_EVERY(100, "path-eval entry: pathScale=%.2f pathRange=%.2f "
+                               "obstaclePts=%d joyDir=%.1f relDis=%.2f\n",
+                          (float)pathScale, pathRange, (int)plannerCloudCrop.points.size(),
+                          joyDir, relativeGoalDis);
+
+                int _dbg_retries = 0;
                 while (pathScale >= minPathScale && pathRange >= minPathRange) {
+                    _dbg_retries++;
                     // Clear evaluation arrays
                     for (int i = 0; i < 36 * pathNum; i++) {
                         clearPathList[i] = 0;
@@ -1041,6 +1063,12 @@ int main(int argc, char** argv) {
                         // Note: slow_down publishing omitted (no direct equivalent);
                         // the penalty info could be added to path metadata if needed.
                         (void)penaltyScore;
+                        DBG_EVERY(100, "path-eval SELECTED group=%d (rotDir=%d grp=%d) "
+                                       "nPaths=%d penalty=%.3f retries=%d pathScale=%.2f pathRange=%.2f\n",
+                                  selectedGroupID, selectedGroupID / groupNum,
+                                  selectedGroupID % groupNum,
+                                  selectedPathNum, penaltyScore,
+                                  _dbg_retries, (float)pathScale, pathRange);
                     }
 
                     // Build and publish path from selected group
@@ -1095,10 +1123,20 @@ int main(int argc, char** argv) {
                         pathMsg.poses_length = (int32_t)pathMsg.poses.size();
                         pathMsg.header = dimos::make_header("vehicle", odomTime);
                         lcm.publish(topicPath, &pathMsg);
+
+                        DBG_EVERY(100, "path published: groupID=%d poses=%d "
+                                       "pathScale=%.2f pathRange=%.2f\n",
+                                  selectedGroupID, (int)pathMsg.poses_length,
+                                  pathScale, pathRange);
                     }
 
                     // If no group found, shrink scale/range and retry
                     if (selectedGroupID < 0) {
+                        DBG_EVERY(50, "path-eval retry #%d: no group found — "
+                                      "shrinking (pathScale=%.2f pathRange=%.2f "
+                                      "minObsAngCW=%.1f minObsAngCCW=%.1f)\n",
+                                  _dbg_retries, (float)pathScale, pathRange,
+                                  minObsAngCW, minObsAngCCW);
                         if (pathScale >= minPathScale + pathScaleStep) {
                             pathScale -= pathScaleStep;
                             pathRange = (float)(adjacentRange * pathScale / defPathScale);
@@ -1114,6 +1152,12 @@ int main(int argc, char** argv) {
 
                 // If no path found at any scale, publish zero-length stop path
                 if (!pathFound) {
+                    DBG_EVERY(20, "NO PATH FOUND (publishing stop) "
+                                  "autonomy=%d goal=(%.2f,%.2f) relDis=%.2f joyDir=%.1f "
+                                  "obstaclePts=%d minPathScale=%.2f minPathRange=%.2f\n",
+                              (int)autonomyMode, goalX, goalY, relativeGoalDis, joyDir,
+                              (int)plannerCloudCrop.points.size(),
+                              (float)minPathScale, (float)minPathRange);
                     nav_msgs::Path pathMsg;
                     pathMsg.poses.resize(1);
                     pathMsg.poses_length = 1;
