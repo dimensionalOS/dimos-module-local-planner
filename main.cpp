@@ -230,9 +230,12 @@ static float joySpeed = 0;
 static float joySpeedRaw = 0;
 static float joyDir = 0;
 
-// Hysteresis: remember last selected group to avoid oscillation
+// Hysteresis: remember last selected group to avoid oscillation.
+// Bonus tiers are hard-coded in the selection loop (see "Tiered hysteresis").
 static int lastSelectedFullGroupID = -1;
-static double groupHysteresis = 0.50;  // 50% bonus to previous selection
+
+// Debug: counters for 1 Hz summary line (see main loop)
+static int selChangesSinceSummary = 0;
 
 // ---------------------------------------------------------------------------
 // Path data constants
@@ -300,6 +303,7 @@ static string topicOdometry;
 static string topicJoyCmd;
 static string topicWayPoint;
 static string topicPath;
+static string topicObstacleCloud;
 
 // ---------------------------------------------------------------------------
 // Current wall-clock time helper (replaces nh->now())
@@ -443,10 +447,23 @@ public:
                      const std::string& /*channel*/,
                      const geometry_msgs::PointStamped* goal) {
         std::lock_guard<std::mutex> lk(stateMtx);
-        goalReached = false;
+        double prevX = goalX;
+        double prevY = goalY;
         goalX = goal->point.x;
         goalY = goal->point.y;
-        lastSelectedFullGroupID = -1;  // Reset hysteresis on new goal
+        // FAR re-publishes the same waypoint at ~5 Hz while the robot
+        // tracks it. Treat a re-publish as a no-op: don't reset
+        // hysteresis (causes group oscillation) and don't unstick
+        // goalReached (causes stop/go flicker at the goal).
+        bool waypointChanged = fabs(goalX - prevX) > 1e-3 || fabs(goalY - prevY) > 1e-3;
+        if (waypointChanged) {
+            goalReached = false;
+            lastSelectedFullGroupID = -1;
+            fprintf(stderr,
+                    "[local_planner] new waypoint: (%.3f,%.3f) dx=%.3f dy=%.3f\n",
+                    goalX, goalY, goalX - prevX, goalY - prevY);
+            fflush(stderr);
+        }
     }
 };
 
@@ -658,6 +675,7 @@ int main(int argc, char** argv) {
     topicJoyCmd         = mod.topic("joy_cmd");
     topicWayPoint       = mod.topic("way_point");
     topicPath           = mod.topic("path");
+    topicObstacleCloud  = mod.topic("obstacle_cloud");
 
     // Optional terrain_map topic (only used when useTerrainAnalysis is true)
     string topicTerrainMap;
@@ -738,7 +756,39 @@ int main(int argc, char** argv) {
         {
             std::lock_guard<std::mutex> lk(stateMtx);
 
-            if (newLaserCloud || newTerrainCloud) {
+            // 1 Hz summary of planner state for debugging
+            {
+                static double summary_last_time = 0.0;
+                if (odomTime - summary_last_time >= 1.0) {
+                    summary_last_time = odomTime;
+                    float closest = 1e9f;
+                    for (const auto& p : plannerCloudCrop.points) {
+                        float d = sqrt(p.x * p.x + p.y * p.y);
+                        if (d < closest) closest = d;
+                    }
+                    if (plannerCloudCrop.points.empty()) closest = 0.0f;
+                    fprintf(stderr,
+                            "[local_planner] 1Hz: cropN=%d closest=%.1f "
+                            "goalReached=%d selGroup=%d selChanges=%d\n",
+                            (int)plannerCloudCrop.points.size(), closest,
+                            goalReached ? 1 : 0, lastSelectedFullGroupID,
+                            selChangesSinceSummary);
+                    fflush(stderr);
+                    selChangesSinceSummary = 0;
+                }
+            }
+
+            // Re-run crop+selection+publish every tick (100 Hz), not only
+            // when a new cloud arrives. The path is in vehicle frame, so as
+            // the robot rotates, rerun's tf#/sensor transform rotates the
+            // rendered path with it. If we only re-publish at terrain-update
+            // rate (~4 Hz), the path visibly drifts in world frame between
+            // publishes and the path_follower chases a stale look-ahead
+            // direction. Re-running every tick keeps joyDir / rotAng
+            // synchronized with the current yaw. The obstacle cloud we
+            // test against may be slightly stale, but its transform into
+            // vehicle frame is always fresh.
+            if (true) {
                 if (newLaserCloud) {
                     newLaserCloud = false;
 
@@ -814,6 +864,33 @@ int main(int argc, char** argv) {
                     float dis = sqrt(point.x * point.x + point.y * point.y);
                     if (dis < adjacentRange) {
                         plannerCloudCrop.push_back(point);
+                    }
+                }
+
+                // ---------------------------------------------------------
+                // Publish obstacle_cloud (vehicle-frame crop) at ~5 Hz so
+                // debuggers can see exactly what the planner treats as
+                // obstacles. intensity carries h (height above ground).
+                // ---------------------------------------------------------
+                {
+                    static double obstacleCloudLastPub = 0.0;
+                    const double obstacleCloudPeriod = 0.2;  // 5 Hz
+                    if (odomTime - obstacleCloudLastPub >= obstacleCloudPeriod) {
+                        obstacleCloudLastPub = odomTime;
+                        std::vector<smartnav::PointXYZI> pts;
+                        pts.reserve(plannerCloudCrop.points.size());
+                        for (const auto& p : plannerCloudCrop.points) {
+                            smartnav::PointXYZI q;
+                            q.x = p.x;
+                            q.y = p.y;
+                            q.z = p.z;
+                            q.intensity = p.intensity;  // h = height above ground
+                            pts.push_back(q);
+                        }
+                        sensor_msgs::PointCloud2 obsMsg =
+                            smartnav::build_pointcloud2(pts, "vehicle", odomTime);
+                        obsMsg.header = dimos::make_header("vehicle", odomTime);
+                        lcm.publish(topicObstacleCloud, &obsMsg);
                     }
                 }
 
@@ -1028,21 +1105,46 @@ int main(int argc, char** argv) {
                         }
                     }
 
-                    // Select best group (with hysteresis to prevent oscillation)
+                    // Select best group with Gaussian hysteresis on rotDir
+                    // distance from the last selection. Because we now
+                    // re-score every tick at 100 Hz, tiny joyDir drifts
+                    // (driven by path-follower yaw commands in response to
+                    // our own selection) create a tight feedback loop:
+                    // selected rotAng -> yaw command -> joyDir shift ->
+                    // different group wins -> rotAng flips. Apply an
+                    // exp(-diff^2/(2*sigma^2)) bonus centered on the
+                    // previous rotDir. sigma=2 gives:
+                    //   diff=0: 2.00x   diff=1: 1.88x   diff=2: 1.61x
+                    //   diff=3: 1.32x   diff=4: 1.14x   diff=6: 1.01x
                     int selectedGroupID = -1;
+                    float maxScore = 0;
                     if (preSelectedGroupID >= 0) {
                         selectedGroupID = preSelectedGroupID;
                     } else {
-                        float maxScore = 0;
+                        int lastRotDir = (lastSelectedFullGroupID >= 0)
+                            ? (lastSelectedFullGroupID / groupNum) : -1;
+                        const float hysteresisSigma = 2.0f;
                         for (int i = 0; i < 36 * groupNum; i++) {
                             int rotDir = int(i / groupNum);
                             float rotAng = (10.0f * rotDir - 180.0f) * (float)PI / 180.0f;
                             float rotDeg = 10.0f * rotDir;
                             if (rotDeg > 180.0f) rotDeg -= 360.0f;
                             float score = clearPathPerGroupScore[i];
-                            // Hysteresis: give bonus to previously selected group
-                            if (lastSelectedFullGroupID >= 0 && i == lastSelectedFullGroupID) {
-                                score *= (1.0f + (float)groupHysteresis);
+                            // Gaussian rotDir hysteresis
+                            if (lastRotDir >= 0) {
+                                int diff = abs(rotDir - lastRotDir);
+                                if (diff > 18) diff = 36 - diff;  // wrap-aware
+                                float bonus = 1.0f + expf(
+                                    -(float)(diff * diff) /
+                                    (2.0f * hysteresisSigma * hysteresisSigma));
+                                // Extra bonus for exact same group (same
+                                // startPath too) to damp within-rotDir
+                                // startPath flapping that jitters the
+                                // rendered path + yaw commands.
+                                if (i == lastSelectedFullGroupID) {
+                                    bonus += 0.5f;
+                                }
+                                score *= bonus;
                             }
                             if (maxScore < score &&
                                 ((rotAng * 180.0f / (float)PI > minObsAngCW && rotAng * 180.0f / (float)PI < minObsAngCCW) ||
@@ -1067,6 +1169,16 @@ int main(int argc, char** argv) {
 
                     // Build and publish path from selected group
                     if (selectedGroupID >= 0) {
+                        if (selectedGroupID != lastSelectedFullGroupID) {
+                            fprintf(stderr,
+                                    "[local_planner] group: old=%d new=%d score=%.3f "
+                                    "minObsAng=[%.1f,%.1f] cropN=%d\n",
+                                    lastSelectedFullGroupID, selectedGroupID,
+                                    maxScore, minObsAngCW, minObsAngCCW,
+                                    (int)plannerCloudCrop.points.size());
+                            fflush(stderr);
+                            selChangesSinceSummary++;
+                        }
                         lastSelectedFullGroupID = selectedGroupID;
                         int rotDir = int(selectedGroupID / groupNum);
                         float rotAng = (10.0f * rotDir - 180.0f) * (float)PI / 180.0f;
@@ -1136,7 +1248,22 @@ int main(int argc, char** argv) {
                 pathScale = defPathScale;
 
                 // If no path found at any scale, publish zero-length stop path
+                static bool wasNoPath = false;
+                if (!pathFound && !wasNoPath) {
+                    float closest = 1e9f;
+                    for (const auto& p : plannerCloudCrop.points) {
+                        float d = sqrt(p.x * p.x + p.y * p.y);
+                        if (d < closest) closest = d;
+                    }
+                    if (plannerCloudCrop.points.empty()) closest = 0.0f;
+                    fprintf(stderr,
+                            "[local_planner] no path at any scale; cropN=%d closest=%.2fm\n",
+                            (int)plannerCloudCrop.points.size(), closest);
+                    fflush(stderr);
+                }
+                wasNoPath = !pathFound;
                 if (!pathFound) {
+
                     nav_msgs::Path pathMsg;
                     pathMsg.poses.resize(1);
                     pathMsg.poses_length = 1;

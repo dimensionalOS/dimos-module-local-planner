@@ -56,6 +56,8 @@ public:
     bool arg_bool(const std::string& key, bool default_val = false) const {
         auto it = args_.find(key);
         if (it == args_.end()) return default_val;
+        // Explicitly handle "false" and "0" as false, otherwise check for true
+        if (it->second == "false" || it->second == "0") return false;
         return it->second == "true" || it->second == "1";
     }
 
