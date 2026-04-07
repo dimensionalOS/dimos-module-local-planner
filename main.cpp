@@ -10,9 +10,16 @@
 //   odometry         — vehicle pose from SLAM
 //   way_point        — navigation goal from far planner / click-to-goal
 //   joy_cmd          — joystick/teleop velocity (Twist)
+//   goal_pose        — goal with orientation (PoseStamped)        [ROS: localPlanner.cpp:668]
+//   added_obstacles  — extra obstacle points (PointCloud2)        [ROS: localPlanner.cpp:674]
+//   check_obstacle   — toggle obstacle checking (Bool)            [ROS: localPlanner.cpp:676]
+//   cancel_goal      — cancel current goal (Bool)                 [ROS: localPlanner.cpp:678]
 //
 // Publications (LCM):
 //   path             — selected local path (nav_msgs::Path)
+//   free_paths       — collision-free candidate paths (PointCloud2) [ROS: localPlanner.cpp:689]
+//   slow_down        — slow-down level 0-3 (Int8)                  [ROS: localPlanner.cpp:680]
+//   goal_reached     — goal reached flag (Bool)                    [ROS: localPlanner.cpp:686]
 
 #include <atomic>
 #include <chrono>
@@ -38,6 +45,8 @@
 #include "geometry_msgs/PointStamped.hpp"
 #include "geometry_msgs/Twist.hpp"
 #include "geometry_msgs/PoseStamped.hpp"
+#include "std_msgs/Bool.hpp"
+#include "std_msgs/Int8.hpp"
 
 static const double PI = 3.1415926;
 
@@ -256,6 +265,38 @@ static void readCorrespondences(const std::string& pathFolder,
     fclose(filePtr);
 }
 
+// readPaths: load visualization path geometries [ROS: localPlanner.cpp:439-478]
+static void readPaths(const std::string& pathFolder,
+                      std::vector<smartnav::PointXYZI> paths[PATH_NUM]) {
+    std::string fileName = pathFolder + "/paths.ply";
+    FILE* filePtr = fopen(fileName.c_str(), "r");
+    if (!filePtr) {
+        fprintf(stderr, "[LocalPlanner] Cannot read %s (free_paths viz disabled)\n",
+                fileName.c_str());
+        return;
+    }
+    int pointNum = readPlyHeader(filePtr);
+    smartnav::PointXYZI point;
+    int pointSkipNum = 30;  // [ROS: localPlanner.cpp:453] subsample for viz
+    int pointSkipCount = 0;
+    int pathID;
+    for (int i = 0; i < pointNum; i++) {
+        if (fscanf(filePtr, "%f %f %f %d %f",
+                   &point.x, &point.y, &point.z, &pathID, &point.intensity) != 5) {
+            fprintf(stderr, "[LocalPlanner] Error reading paths.ply\n");
+            exit(1);
+        }
+        if (pathID >= 0 && pathID < PATH_NUM) {
+            pointSkipCount++;
+            if (pointSkipCount > pointSkipNum) {
+                paths[pathID].push_back(point);
+                pointSkipCount = 0;
+            }
+        }
+    }
+    fclose(filePtr);
+}
+
 // ─── LCM Handler ────────────────────────────────────────────────────────────
 
 static std::atomic<bool> g_running{true};
@@ -267,9 +308,13 @@ struct PlannerHandler {
 
     // Topic strings for publishing
     std::string topic_path;
+    std::string topic_free_paths;
+    std::string topic_slow_down;
+    std::string topic_goal_reached;
 
     // Path data
     std::vector<PointXYZ> startPaths[GROUP_NUM];
+    std::vector<smartnav::PointXYZI> paths[PATH_NUM];  // for free_paths viz [ROS: localPlanner.cpp:137]
     int pathList[PATH_NUM] = {0};
     float endDirPathList[PATH_NUM] = {0};
     std::vector<int> correspondences[GRID_VOXEL_NUM];
@@ -288,11 +333,14 @@ struct PlannerHandler {
 
     double goalX = 0;
     double goalY = 0;
+    double goalYaw = 0;
+    bool hasGoalYaw = false;
     bool goalReached = false;
 
     // Obstacle clouds
     std::vector<smartnav::PointXYZI> laserCloudDwz;
     std::vector<smartnav::PointXYZI> terrainCloudDwz;
+    std::vector<smartnav::PointXYZI> addedObstacles;  // [ROS: localPlanner.cpp:134]
     bool newLaserCloud = false;
     bool newTerrainCloud = false;
 
@@ -401,6 +449,65 @@ struct PlannerHandler {
         if (fwd < 0 && !config.twoWayDrive) joySpeed = 0;
     }
 
+    // [ROS: localPlanner.cpp:278-297] — goal with orientation
+    void onGoalPose(const lcm::ReceiveBuffer*, const std::string&,
+                    const geometry_msgs::PoseStamped* msg) {
+        std::lock_guard<std::mutex> lock(mtx);
+        goalReached = false;
+        goalX = msg->pose.position.x;
+        goalY = msg->pose.position.y;
+
+        // Check if quaternion is all zeros (ignore orientation)
+        if (msg->pose.orientation.x == 0 && msg->pose.orientation.y == 0 &&
+            msg->pose.orientation.z == 0 && msg->pose.orientation.w == 0) {
+            hasGoalYaw = false;
+            goalYaw = 0;
+        } else {
+            double roll, pitch, yaw;
+            smartnav::quat_to_rpy(msg->pose.orientation.x, msg->pose.orientation.y,
+                                  msg->pose.orientation.z, msg->pose.orientation.w,
+                                  roll, pitch, yaw);
+            goalYaw = yaw;
+            hasGoalYaw = true;
+        }
+    }
+
+    // [ROS: localPlanner.cpp:349-358] — added obstacle points
+    void onAddedObstacles(const lcm::ReceiveBuffer*, const std::string&,
+                          const sensor_msgs::PointCloud2* msg) {
+        std::lock_guard<std::mutex> lock(mtx);
+        addedObstacles = smartnav::parse_pointcloud2(*msg);
+        for (auto& p : addedObstacles) {
+            p.intensity = 200.0f;  // mark as hard obstacle [ROS: localPlanner.cpp:356]
+        }
+    }
+
+    // [ROS: localPlanner.cpp:360-366] — toggle obstacle checking
+    void onCheckObstacle(const lcm::ReceiveBuffer*, const std::string&,
+                         const std_msgs::Bool* msg) {
+        std::lock_guard<std::mutex> lock(mtx);
+        auto now = std::chrono::steady_clock::now();
+        double checkObsTime = std::chrono::duration<double>(now.time_since_epoch()).count();
+        if (config.autonomyMode && checkObsTime - joyTime > config.joyToCheckObstacleDelay) {
+            config.checkObstacle = msg->data;
+        }
+    }
+
+    // [ROS: localPlanner.cpp:368-377] — cancel current goal
+    void onCancelGoal(const lcm::ReceiveBuffer*, const std::string&,
+                      const std_msgs::Bool* msg) {
+        std::lock_guard<std::mutex> lock(mtx);
+        if (msg->data && config.autonomyMode) {
+            goalReached = true;
+            hasGoalYaw = false;
+            // Publish goal_reached = false (cancelled, not reached)
+            std_msgs::Bool reachedMsg;
+            reachedMsg.data = false;
+            lcm->publish(topic_goal_reached, &reachedMsg);
+            printf("[LocalPlanner] Goal cancelled\n");
+        }
+    }
+
     // ── Main planning loop (called from main thread) ──
 
     void planOnce() {
@@ -444,6 +551,21 @@ struct PlannerHandler {
             }
         }
 
+        // [ROS: localPlanner.cpp:793-806] — add added_obstacles to planner cloud
+        for (auto& p : addedObstacles) {
+            float px = p.x - vehicleX;
+            float py = p.y - vehicleY;
+            smartnav::PointXYZI pt;
+            pt.x = px * cosYaw + py * sinYaw;
+            pt.y = -px * sinYaw + py * cosYaw;
+            pt.z = p.z;
+            pt.intensity = p.intensity;
+            float dis = std::sqrt(pt.x * pt.x + pt.y * pt.y);
+            if (dis < config.adjacentRange) {
+                plannerCloudCrop.push_back(pt);
+            }
+        }
+
         // Compute goal direction in autonomy mode
         float pathRange = (float)config.adjacentRange;
         if (config.pathRangeBySpeed) pathRange = (float)config.adjacentRange * joySpeed;
@@ -459,14 +581,24 @@ struct PlannerHandler {
             relativeGoalDis = std::sqrt(relGoalX * relGoalX + relGoalY * relGoalY);
 
             bool positionReached = relativeGoalDis < (float)config.goalReachedThreshold;
-            bool orientationReached = true;
-            // No goal yaw from PointStamped; always true
+            bool orientationReached = true;  // [ROS: localPlanner.cpp:821-825]
+            if (hasGoalYaw) {
+                double yawError = normalizeAngle(goalYaw - vehicleYaw);
+                orientationReached = std::fabs(yawError) < config.goalYawThreshold;
+            }
 
             if (positionReached && orientationReached && !goalReached) {
                 goalReached = true;
+                std_msgs::Bool reachedMsg;
+                reachedMsg.data = true;
+                lcm->publish(topic_goal_reached, &reachedMsg);  // [ROS: localPlanner.cpp:831]
             }
 
             if (goalReached) {
+                relativeGoalDis = 0;
+                localJoyDir = 0;
+            } else if (positionReached && hasGoalYaw && !orientationReached) {
+                // [ROS: localPlanner.cpp:837-839] position OK, rotating to goal yaw
                 relativeGoalDis = 0;
                 localJoyDir = 0;
             } else if (!positionReached) {
@@ -675,6 +807,22 @@ struct PlannerHandler {
                 }
             }
 
+            // [ROS: localPlanner.cpp:1008-1019] — publish slow_down level
+            if (selectedGroupID >= 0) {
+                int selectedPathNum = clearPathPerGroupNum[selectedGroupID];
+                float penaltyScore = 0;
+                if (selectedPathNum > 0) {
+                    penaltyScore = pathPenaltyPerGroupScore[selectedGroupID] / selectedPathNum;
+                }
+                std_msgs::Int8 slow;
+                if (penaltyScore > config.costHeightThre1) slow.data = 1;
+                else if (penaltyScore > config.costHeightThre2) slow.data = 2;
+                else if (selectedPathNum < config.slowPathNumThre &&
+                         std::fabs(selectedGroupID - 129) > config.slowGroupNumThre) slow.data = 3;
+                else slow.data = 0;
+                lcm->publish(topic_slow_down, &slow);
+            }
+
             if (selectedGroupID >= 0) {
                 // Build and publish selected path
                 int rotDir = selectedGroupID / GROUP_NUM;
@@ -711,6 +859,38 @@ struct PlannerHandler {
                     pathMsg.poses_length = (int32_t)pathMsg.poses.size();
                     pathMsg.header = dimos::make_header("vehicle", odomTime);
                     lcm->publish(topic_path, &pathMsg);
+                }
+
+                // [ROS: localPlanner.cpp:1067-1112] — publish free_paths visualization
+                {
+                    std::vector<smartnav::PointXYZI> freePoints;
+                    for (int i = 0; i < 36 * PATH_NUM; i++) {
+                        int rd = i / PATH_NUM;
+                        float ra = (10.0f * rd - 180.0f) * (float)PI / 180.0f;
+                        float angDiff = std::fabs(localJoyDir - (10.0f * rd - 180.0f));
+                        if (angDiff > 180.0f) angDiff = 360.0f - angDiff;
+                        if (angDiff > config.dirThre) continue;
+
+                        if (clearPathList[i] < config.pointPerPathThre) {
+                            int freePathLen = (int)paths[i % PATH_NUM].size();
+                            for (int j = 0; j < freePathLen; j++) {
+                                auto& pp = paths[i % PATH_NUM][j];
+                                float dis = std::sqrt(pp.x * pp.x + pp.y * pp.y);
+                                if (dis <= curPathRange / curPathScale &&
+                                    (dis <= (relativeGoalDis + (float)config.goalClearRange) / curPathScale ||
+                                     !config.pathCropByGoal)) {
+                                    smartnav::PointXYZI fp;
+                                    fp.x = curPathScale * (std::cos(ra) * pp.x - std::sin(ra) * pp.y);
+                                    fp.y = curPathScale * (std::sin(ra) * pp.x + std::cos(ra) * pp.y);
+                                    fp.z = curPathScale * pp.z;
+                                    fp.intensity = 1.0f;
+                                    freePoints.push_back(fp);
+                                }
+                            }
+                        }
+                    }
+                    auto freeMsg = smartnav::build_pointcloud2(freePoints, "vehicle", odomTime);
+                    lcm->publish(topic_free_paths, &freeMsg);
                 }
 
                 pathFound = true;
@@ -820,6 +1000,7 @@ int main(int argc, char** argv) {
     handler.config = config;
 
     readStartPaths(config.pathFolder, handler.startPaths);
+    readPaths(config.pathFolder, handler.paths);
     readPathList(config.pathFolder, handler.pathList, handler.endDirPathList);
     readCorrespondences(config.pathFolder, handler.correspondences);
 
@@ -842,25 +1023,40 @@ int main(int argc, char** argv) {
     }
     handler.lcm = &lcm;
     handler.topic_path = mod.topic("path");
+    handler.topic_free_paths = mod.topic("free_paths");
+    handler.topic_slow_down = mod.topic("slow_down");
+    handler.topic_goal_reached = mod.topic("goal_reached");
 
     std::string topic_scan = mod.topic("registered_scan");
     std::string topic_odom = mod.topic("odometry");
     std::string topic_terrain = mod.topic("terrain_map");
     std::string topic_waypoint = mod.topic("way_point");
     std::string topic_joy = mod.topic("joy_cmd");
+    std::string topic_goal_pose = mod.topic("goal_pose");
+    std::string topic_added_obs = mod.topic("added_obstacles");
+    std::string topic_check_obs = mod.topic("check_obstacle");
+    std::string topic_cancel = mod.topic("cancel_goal");
 
     lcm.subscribe(topic_odom, &PlannerHandler::onOdometry, &handler);
     lcm.subscribe(topic_scan, &PlannerHandler::onRegisteredScan, &handler);
     lcm.subscribe(topic_terrain, &PlannerHandler::onTerrainMap, &handler);
     lcm.subscribe(topic_waypoint, &PlannerHandler::onWayPoint, &handler);
     lcm.subscribe(topic_joy, &PlannerHandler::onJoyCmd, &handler);
+    lcm.subscribe(topic_goal_pose, &PlannerHandler::onGoalPose, &handler);
+    lcm.subscribe(topic_added_obs, &PlannerHandler::onAddedObstacles, &handler);
+    lcm.subscribe(topic_check_obs, &PlannerHandler::onCheckObstacle, &handler);
+    lcm.subscribe(topic_cancel, &PlannerHandler::onCancelGoal, &handler);
 
     printf("[LocalPlanner] Listening on:\n"
            "  registered_scan=%s\n  odometry=%s\n  terrain_map=%s\n"
-           "  way_point=%s\n  joy_cmd=%s\n",
+           "  way_point=%s\n  joy_cmd=%s\n  goal_pose=%s\n"
+           "  added_obstacles=%s\n  check_obstacle=%s\n  cancel_goal=%s\n",
            topic_scan.c_str(), topic_odom.c_str(), topic_terrain.c_str(),
-           topic_waypoint.c_str(), topic_joy.c_str());
-    printf("[LocalPlanner] Publishing: path=%s\n", handler.topic_path.c_str());
+           topic_waypoint.c_str(), topic_joy.c_str(), topic_goal_pose.c_str(),
+           topic_added_obs.c_str(), topic_check_obs.c_str(), topic_cancel.c_str());
+    printf("[LocalPlanner] Publishing: path=%s free_paths=%s slow_down=%s goal_reached=%s\n",
+           handler.topic_path.c_str(), handler.topic_free_paths.c_str(),
+           handler.topic_slow_down.c_str(), handler.topic_goal_reached.c_str());
 
     // Main loop at 100Hz (matching ROS original)
     auto loop_period = std::chrono::milliseconds(10);
