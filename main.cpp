@@ -46,7 +46,9 @@
 #include "geometry_msgs/Twist.hpp"
 #include "geometry_msgs/PoseStamped.hpp"
 #include "std_msgs/Bool.hpp"
+#include "std_msgs/Float32.hpp"
 #include "std_msgs/Int8.hpp"
+#include "geometry_msgs/PolygonStamped.hpp"
 
 static const double PI = 3.1415926;
 
@@ -341,6 +343,7 @@ struct PlannerHandler {
     std::vector<smartnav::PointXYZI> laserCloudDwz;
     std::vector<smartnav::PointXYZI> terrainCloudDwz;
     std::vector<smartnav::PointXYZI> addedObstacles;  // [ROS: localPlanner.cpp:134]
+    std::vector<smartnav::PointXYZI> boundaryCloud;  // [ROS: localPlanner.cpp:133]
     bool newLaserCloud = false;
     bool newTerrainCloud = false;
 
@@ -449,6 +452,59 @@ struct PlannerHandler {
         if (fwd < 0 && !config.twoWayDrive) joySpeed = 0;
     }
 
+    // [ROS: localPlanner.cpp:299-308] — speed command override
+    void onSpeed(const lcm::ReceiveBuffer*, const std::string&,
+                 const std_msgs::Float32* msg) {
+        std::lock_guard<std::mutex> lock(mtx);
+        auto now = std::chrono::steady_clock::now();
+        double speedTime = std::chrono::duration<double>(now.time_since_epoch()).count();
+        if (config.autonomyMode && speedTime - joyTime > config.joyToSpeedDelay && joySpeedRaw == 0) {
+            joySpeed = msg->data / (float)config.maxSpeed;
+            if (joySpeed < 0) joySpeed = 0;
+            else if (joySpeed > 1.0f) joySpeed = 1.0f;
+        }
+    }
+
+    // [ROS: localPlanner.cpp:310-347] — navigation boundary as polygon
+    void onNavigationBoundary(const lcm::ReceiveBuffer*, const std::string&,
+                              const geometry_msgs::PolygonStamped* msg) {
+        std::lock_guard<std::mutex> lock(mtx);
+        boundaryCloud.clear();
+        int boundarySize = msg->polygon.points_length;
+        if (boundarySize < 1) return;
+
+        smartnav::PointXYZI point1, point2;
+        point2.x = msg->polygon.points[0].x;
+        point2.y = msg->polygon.points[0].y;
+        point2.z = msg->polygon.points[0].z;
+
+        for (int i = 0; i < boundarySize; i++) {
+            point1 = point2;
+            point2.x = msg->polygon.points[i].x;
+            point2.y = msg->polygon.points[i].y;
+            point2.z = msg->polygon.points[i].z;
+
+            if (point1.z == point2.z) {
+                float disX = point1.x - point2.x;
+                float disY = point1.y - point2.y;
+                float dis = std::sqrt(disX * disX + disY * disY);
+                int pointNum = (int)(dis / config.terrainVoxelSize) + 1;
+                for (int pID = 0; pID < pointNum; pID++) {
+                    float t = (float)pID / (float)pointNum;
+                    smartnav::PointXYZI p;
+                    p.x = t * point1.x + (1.0f - t) * point2.x;
+                    p.y = t * point1.y + (1.0f - t) * point2.y;
+                    p.z = 0;
+                    p.intensity = 100.0f;  // [ROS: localPlanner.cpp:339]
+                    // Push multiple copies as per pointPerPathThre [ROS: localPlanner.cpp:341]
+                    for (int j = 0; j < config.pointPerPathThre; j++) {
+                        boundaryCloud.push_back(p);
+                    }
+                }
+            }
+        }
+    }
+
     // [ROS: localPlanner.cpp:278-297] — goal with orientation
     void onGoalPose(const lcm::ReceiveBuffer*, const std::string&,
                     const geometry_msgs::PoseStamped* msg) {
@@ -547,6 +603,21 @@ struct PlannerHandler {
             float dis = std::sqrt(pt.x * pt.x + pt.y * pt.y);
             if (dis < config.adjacentRange &&
                 ((pt.z > config.minRelZ && pt.z < config.maxRelZ) || config.useTerrainAnalysis)) {
+                plannerCloudCrop.push_back(pt);
+            }
+        }
+
+        // [ROS: localPlanner.cpp:778-791] — add boundary cloud
+        for (auto& p : boundaryCloud) {
+            float px = p.x - vehicleX;
+            float py = p.y - vehicleY;
+            smartnav::PointXYZI pt;
+            pt.x = px * cosYaw + py * sinYaw;
+            pt.y = -px * sinYaw + py * cosYaw;
+            pt.z = p.z;
+            pt.intensity = p.intensity;
+            float dis = std::sqrt(pt.x * pt.x + pt.y * pt.y);
+            if (dis < config.adjacentRange) {
                 plannerCloudCrop.push_back(pt);
             }
         }
@@ -1033,6 +1104,8 @@ int main(int argc, char** argv) {
     std::string topic_waypoint = mod.topic("way_point");
     std::string topic_joy = mod.topic("joy_cmd");
     std::string topic_goal_pose = mod.topic("goal_pose");
+    std::string topic_speed = mod.topic("speed");
+    std::string topic_boundary = mod.topic("navigation_boundary");
     std::string topic_added_obs = mod.topic("added_obstacles");
     std::string topic_check_obs = mod.topic("check_obstacle");
     std::string topic_cancel = mod.topic("cancel_goal");
@@ -1043,6 +1116,8 @@ int main(int argc, char** argv) {
     lcm.subscribe(topic_waypoint, &PlannerHandler::onWayPoint, &handler);
     lcm.subscribe(topic_joy, &PlannerHandler::onJoyCmd, &handler);
     lcm.subscribe(topic_goal_pose, &PlannerHandler::onGoalPose, &handler);
+    lcm.subscribe(topic_speed, &PlannerHandler::onSpeed, &handler);
+    lcm.subscribe(topic_boundary, &PlannerHandler::onNavigationBoundary, &handler);
     lcm.subscribe(topic_added_obs, &PlannerHandler::onAddedObstacles, &handler);
     lcm.subscribe(topic_check_obs, &PlannerHandler::onCheckObstacle, &handler);
     lcm.subscribe(topic_cancel, &PlannerHandler::onCancelGoal, &handler);
@@ -1050,9 +1125,11 @@ int main(int argc, char** argv) {
     printf("[LocalPlanner] Listening on:\n"
            "  registered_scan=%s\n  odometry=%s\n  terrain_map=%s\n"
            "  way_point=%s\n  joy_cmd=%s\n  goal_pose=%s\n"
+           "  speed=%s\n  navigation_boundary=%s\n"
            "  added_obstacles=%s\n  check_obstacle=%s\n  cancel_goal=%s\n",
            topic_scan.c_str(), topic_odom.c_str(), topic_terrain.c_str(),
            topic_waypoint.c_str(), topic_joy.c_str(), topic_goal_pose.c_str(),
+           topic_speed.c_str(), topic_boundary.c_str(),
            topic_added_obs.c_str(), topic_check_obs.c_str(), topic_cancel.c_str());
     printf("[LocalPlanner] Publishing: path=%s free_paths=%s slow_down=%s goal_reached=%s\n",
            handler.topic_path.c_str(), handler.topic_free_paths.c_str(),
