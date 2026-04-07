@@ -16,8 +16,6 @@ FetchContent_MakeAvailable(dimos_lcm)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(LCM REQUIRED lcm)
 find_package(Eigen3 REQUIRED)
-find_package(PCL 1.8 REQUIRED COMPONENTS common filters kdtree)
-add_definitions(-DUSE_PCL)
 
 if(NOT DEFINED SMARTNAV_COMMON_DIR)
   set(SMARTNAV_COMMON_DIR ${CMAKE_CURRENT_SOURCE_DIR}/common)
@@ -29,8 +27,7 @@ target_include_directories(local_planner PRIVATE
   ${dimos_lcm_SOURCE_DIR}/generated/cpp_lcm_msgs
   ${LCM_INCLUDE_DIRS}
   ${EIGEN3_INCLUDE_DIR}
-  ${PCL_INCLUDE_DIRS}
 )
-target_link_libraries(local_planner PRIVATE ${LCM_LIBRARIES} ${PCL_LIBRARIES})
+target_link_libraries(local_planner PRIVATE ${LCM_LIBRARIES})
 target_link_directories(local_planner PRIVATE ${LCM_LIBRARY_DIRS})
 install(TARGETS local_planner DESTINATION bin)

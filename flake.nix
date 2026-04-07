@@ -1,5 +1,5 @@
 {
-  description = "SmartNav local planner module";
+  description = "LocalPlanner native module — DWA-like path selector";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -27,7 +27,7 @@
           src = ./.;
 
           nativeBuildInputs = [ pkgs.cmake pkgs.pkg-config ];
-          buildInputs = [ lcm pkgs.glib pkgs.eigen pkgs.boost pkgs.pcl ];
+          buildInputs = [ lcm pkgs.glib pkgs.eigen ];
 
           cmakeFlags = [
             "-DCMAKE_POLICY_VERSION_MINIMUM=3.5"
