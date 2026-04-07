@@ -559,7 +559,7 @@ struct PlannerHandler {
             // Publish goal_reached = false (cancelled, not reached)
             std_msgs::Bool reachedMsg;
             reachedMsg.data = false;
-            lcm->publish(topic_goal_reached, &reachedMsg);
+            if (!topic_goal_reached.empty()) lcm->publish(topic_goal_reached, &reachedMsg);
             printf("[LocalPlanner] Goal cancelled\n");
         }
     }
@@ -662,7 +662,7 @@ struct PlannerHandler {
                 goalReached = true;
                 std_msgs::Bool reachedMsg;
                 reachedMsg.data = true;
-                lcm->publish(topic_goal_reached, &reachedMsg);  // [ROS: localPlanner.cpp:831]
+                if (!topic_goal_reached.empty()) lcm->publish(topic_goal_reached, &reachedMsg);  // [ROS: localPlanner.cpp:831]
             }
 
             if (goalReached) {
@@ -891,7 +891,7 @@ struct PlannerHandler {
                 else if (selectedPathNum < config.slowPathNumThre &&
                          std::fabs(selectedGroupID - 129) > config.slowGroupNumThre) slow.data = 3;
                 else slow.data = 0;
-                lcm->publish(topic_slow_down, &slow);
+                if (!topic_slow_down.empty()) lcm->publish(topic_slow_down, &slow);
             }
 
             if (selectedGroupID >= 0) {
@@ -961,7 +961,7 @@ struct PlannerHandler {
                         }
                     }
                     auto freeMsg = smartnav::build_pointcloud2(freePoints, "vehicle", odomTime);
-                    lcm->publish(topic_free_paths, &freeMsg);
+                    if (!topic_free_paths.empty()) lcm->publish(topic_free_paths, &freeMsg);
                 }
 
                 pathFound = true;
@@ -1093,47 +1093,64 @@ int main(int argc, char** argv) {
         return 1;
     }
     handler.lcm = &lcm;
-    handler.topic_path = mod.topic("path");
-    handler.topic_free_paths = mod.topic("free_paths");
-    handler.topic_slow_down = mod.topic("slow_down");
-    handler.topic_goal_reached = mod.topic("goal_reached");
 
+    // Helper: get topic string if port was connected by blueprint, else empty.
+    auto opt_topic = [&](const char* name) -> std::string {
+        return mod.has(name) ? mod.topic(name) : "";
+    };
+    // Helper: subscribe only if the topic was provided.
+    auto opt_sub = [&](const std::string& topic, auto method) {
+        if (!topic.empty()) lcm.subscribe(topic, method, &handler);
+    };
+
+    // Required ports (always connected by the blueprint)
+    handler.topic_path = mod.topic("path");
     std::string topic_scan = mod.topic("registered_scan");
     std::string topic_odom = mod.topic("odometry");
     std::string topic_terrain = mod.topic("terrain_map");
     std::string topic_waypoint = mod.topic("way_point");
-    std::string topic_joy = mod.topic("joy_cmd");
-    std::string topic_goal_pose = mod.topic("goal_pose");
-    std::string topic_speed = mod.topic("speed");
-    std::string topic_boundary = mod.topic("navigation_boundary");
-    std::string topic_added_obs = mod.topic("added_obstacles");
-    std::string topic_check_obs = mod.topic("check_obstacle");
-    std::string topic_cancel = mod.topic("cancel_goal");
 
     lcm.subscribe(topic_odom, &PlannerHandler::onOdometry, &handler);
     lcm.subscribe(topic_scan, &PlannerHandler::onRegisteredScan, &handler);
     lcm.subscribe(topic_terrain, &PlannerHandler::onTerrainMap, &handler);
     lcm.subscribe(topic_waypoint, &PlannerHandler::onWayPoint, &handler);
-    lcm.subscribe(topic_joy, &PlannerHandler::onJoyCmd, &handler);
-    lcm.subscribe(topic_goal_pose, &PlannerHandler::onGoalPose, &handler);
-    lcm.subscribe(topic_speed, &PlannerHandler::onSpeed, &handler);
-    lcm.subscribe(topic_boundary, &PlannerHandler::onNavigationBoundary, &handler);
-    lcm.subscribe(topic_added_obs, &PlannerHandler::onAddedObstacles, &handler);
-    lcm.subscribe(topic_check_obs, &PlannerHandler::onCheckObstacle, &handler);
-    lcm.subscribe(topic_cancel, &PlannerHandler::onCancelGoal, &handler);
 
-    printf("[LocalPlanner] Listening on:\n"
+    // Optional ports (connected only when another module provides/consumes them)
+    std::string topic_joy = opt_topic("joy_cmd");
+    std::string topic_goal_pose = opt_topic("goal_pose");
+    std::string topic_speed = opt_topic("speed");
+    std::string topic_boundary = opt_topic("navigation_boundary");
+    std::string topic_added_obs = opt_topic("added_obstacles");
+    std::string topic_check_obs = opt_topic("check_obstacle");
+    std::string topic_cancel = opt_topic("cancel_goal");
+    handler.topic_free_paths = opt_topic("free_paths");
+    handler.topic_slow_down = opt_topic("slow_down");
+    handler.topic_goal_reached = opt_topic("goal_reached");
+
+    opt_sub(topic_joy, &PlannerHandler::onJoyCmd);
+    opt_sub(topic_goal_pose, &PlannerHandler::onGoalPose);
+    opt_sub(topic_speed, &PlannerHandler::onSpeed);
+    opt_sub(topic_boundary, &PlannerHandler::onNavigationBoundary);
+    opt_sub(topic_added_obs, &PlannerHandler::onAddedObstacles);
+    opt_sub(topic_check_obs, &PlannerHandler::onCheckObstacle);
+    opt_sub(topic_cancel, &PlannerHandler::onCancelGoal);
+
+    printf("[LocalPlanner] Subscriptions:\n"
            "  registered_scan=%s\n  odometry=%s\n  terrain_map=%s\n"
-           "  way_point=%s\n  joy_cmd=%s\n  goal_pose=%s\n"
-           "  speed=%s\n  navigation_boundary=%s\n"
-           "  added_obstacles=%s\n  check_obstacle=%s\n  cancel_goal=%s\n",
+           "  way_point=%s\n",
            topic_scan.c_str(), topic_odom.c_str(), topic_terrain.c_str(),
-           topic_waypoint.c_str(), topic_joy.c_str(), topic_goal_pose.c_str(),
-           topic_speed.c_str(), topic_boundary.c_str(),
-           topic_added_obs.c_str(), topic_check_obs.c_str(), topic_cancel.c_str());
-    printf("[LocalPlanner] Publishing: path=%s free_paths=%s slow_down=%s goal_reached=%s\n",
-           handler.topic_path.c_str(), handler.topic_free_paths.c_str(),
-           handler.topic_slow_down.c_str(), handler.topic_goal_reached.c_str());
+           topic_waypoint.c_str());
+    if (!topic_joy.empty()) printf("  joy_cmd=%s\n", topic_joy.c_str());
+    if (!topic_goal_pose.empty()) printf("  goal_pose=%s\n", topic_goal_pose.c_str());
+    if (!topic_speed.empty()) printf("  speed=%s\n", topic_speed.c_str());
+    if (!topic_boundary.empty()) printf("  navigation_boundary=%s\n", topic_boundary.c_str());
+    if (!topic_added_obs.empty()) printf("  added_obstacles=%s\n", topic_added_obs.c_str());
+    if (!topic_check_obs.empty()) printf("  check_obstacle=%s\n", topic_check_obs.c_str());
+    if (!topic_cancel.empty()) printf("  cancel_goal=%s\n", topic_cancel.c_str());
+    printf("[LocalPlanner] Publishing: path=%s\n", handler.topic_path.c_str());
+    if (!handler.topic_free_paths.empty()) printf("  free_paths=%s\n", handler.topic_free_paths.c_str());
+    if (!handler.topic_slow_down.empty()) printf("  slow_down=%s\n", handler.topic_slow_down.c_str());
+    if (!handler.topic_goal_reached.empty()) printf("  goal_reached=%s\n", handler.topic_goal_reached.c_str());
 
     // Main loop at 100Hz (matching ROS original)
     auto loop_period = std::chrono::milliseconds(10);
