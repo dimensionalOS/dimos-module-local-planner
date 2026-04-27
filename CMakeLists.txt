@@ -31,3 +31,12 @@ target_include_directories(local_planner PRIVATE
 target_link_libraries(local_planner PRIVATE ${LCM_LIBRARIES})
 target_link_directories(local_planner PRIVATE ${LCM_LIBRARY_DIRS})
 install(TARGETS local_planner DESTINATION bin)
+
+# Bundle the precomputed motion-primitive library next to the binary so the
+# planner can fall back to it when --paths_dir is not provided. The binary
+# locates this dir relative to its own exe path at runtime.
+install(DIRECTORY paths/
+        DESTINATION share/local_planner/paths
+        FILES_MATCHING
+        PATTERN "*.ply"
+        PATTERN "*.txt")

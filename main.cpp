@@ -28,11 +28,17 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <libgen.h>
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unistd.h>
 #include <unordered_map>
 #include <vector>
+
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
+#endif
 
 #include <lcm/lcm-cpp.hpp>
 
@@ -54,6 +60,34 @@ static const double PI = 3.1415926;
 
 static double normalizeAngle(double angle) {
     return std::atan2(std::sin(angle), std::cos(angle));
+}
+
+// ─── Bundled fallback path resolution ───────────────────────────────────────
+//
+// Resolve the directory holding this binary so we can locate the bundled
+// fallback path-library (installed at <prefix>/share/local_planner/paths by
+// CMake). Returns the empty string on failure.
+static std::string getExecutableDir() {
+    char buf[4096];
+#ifdef __APPLE__
+    uint32_t bufsize = sizeof(buf);
+    if (_NSGetExecutablePath(buf, &bufsize) != 0) return "";
+#elif defined(__linux__)
+    ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+    if (n <= 0) return "";
+    buf[n] = '\0';
+#else
+    return "";
+#endif
+    return std::string(dirname(buf));
+}
+
+// Default fallback location for the precomputed path library: bundled by
+// CMake's install rule next to the executable.
+static std::string defaultBundledPathsDir() {
+    std::string exeDir = getExecutableDir();
+    if (exeDir.empty()) return "";
+    return exeDir + "/../share/local_planner/paths";
 }
 
 // ─── Configuration ──────────────────────────────────────────────────────────
@@ -1055,8 +1089,15 @@ int main(int argc, char** argv) {
     config.goalY                = mod.arg_float("goalY", 0.0f);
 
     if (config.pathFolder.empty()) {
-        fprintf(stderr, "[LocalPlanner] ERROR: --paths_dir is required\n");
-        return 1;
+        config.pathFolder = defaultBundledPathsDir();
+        if (config.pathFolder.empty()) {
+            fprintf(stderr,
+                    "[LocalPlanner] ERROR: --paths_dir not given and bundled fallback "
+                    "could not be located (failed to resolve executable path)\n");
+            return 1;
+        }
+        printf("[LocalPlanner] --paths_dir not given; using bundled fallback: %s\n",
+               config.pathFolder.c_str());
     }
 
     printf("[LocalPlanner] Config: pathFolder=%s adjacentRange=%.1f maxSpeed=%.1f "
