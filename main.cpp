@@ -140,6 +140,9 @@ struct LocalPlannerConfig {
     double goalYawThreshold = 0.15;
     double goalX = 0;
     double goalY = 0;
+    // Publish free_paths visualization cloud.  Disabled saves CPU
+    // (iterates 343×36 candidates and builds a PointCloud2 each cycle).
+    bool publishFreePaths = true;
 };
 
 // ─── Path data constants ────────────────────────────────────────────────────
@@ -967,7 +970,7 @@ struct PlannerHandler {
                 }
 
                 // [ROS: localPlanner.cpp:1067-1112] — publish free_paths visualization
-                {
+                if (config.publishFreePaths && !topic_free_paths.empty()) {
                     std::vector<smartnav::PointXYZI> freePoints;
                     for (int i = 0; i < 36 * PATH_NUM; i++) {
                         int rd = i / PATH_NUM;
@@ -995,7 +998,7 @@ struct PlannerHandler {
                         }
                     }
                     auto freeMsg = smartnav::build_pointcloud2(freePoints, "vehicle", odomTime);
-                    if (!topic_free_paths.empty()) lcm->publish(topic_free_paths, &freeMsg);
+                    lcm->publish(topic_free_paths, &freeMsg);
                 }
 
                 pathFound = true;
@@ -1087,6 +1090,7 @@ int main(int argc, char** argv) {
     config.goalYawThreshold     = mod.arg_float("goalYawThreshold", 0.15f);
     config.goalX                = mod.arg_float("goalX", 0.0f);
     config.goalY                = mod.arg_float("goalY", 0.0f);
+    config.publishFreePaths     = std::string(mod.arg("publishFreePaths", "true")) == "true";
 
     if (config.pathFolder.empty()) {
         config.pathFolder = defaultBundledPathsDir();
@@ -1112,7 +1116,9 @@ int main(int argc, char** argv) {
     handler.config = config;
 
     readStartPaths(config.pathFolder, handler.startPaths);
-    readPaths(config.pathFolder, handler.paths);
+    if (config.publishFreePaths) {
+        readPaths(config.pathFolder, handler.paths);
+    }
     readPathList(config.pathFolder, handler.pathList, handler.endDirPathList);
     readCorrespondences(config.pathFolder, handler.correspondences);
 
