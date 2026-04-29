@@ -365,6 +365,14 @@ struct PlannerHandler {
     float vehicleX = 0, vehicleY = 0, vehicleZ = 0;
     bool hasOdom = false;
 
+    // Effective velocity derived from odometry twist (body-frame).
+    // Published as effective_cmd_vel so downstream modules know the
+    // robot's actual motion state, not just what was commanded.
+    float effectiveVelX = 0;   // forward (m/s)
+    float effectiveVelY = 0;   // lateral (m/s)
+    float effectiveYawRate = 0; // yaw (rad/s)
+    std::string topic_effective_cmd_vel;
+
     double joyTime = 0;
     float joySpeed = 0;
     float joySpeedRaw = 0;
@@ -409,6 +417,13 @@ struct PlannerHandler {
             - std::sin(yaw) * config.sensorOffsetX
             - std::cos(yaw) * config.sensorOffsetY);
         vehicleZ = (float)msg->pose.pose.position.z;
+
+        // Extract body-frame velocity from odom twist.
+        // Odometry twist is in the child frame (body), so we use it directly.
+        effectiveVelX = (float)msg->twist.twist.linear.x;
+        effectiveVelY = (float)msg->twist.twist.linear.y;
+        effectiveYawRate = (float)msg->twist.twist.angular.z;
+
         hasOdom = true;
     }
 
@@ -1030,6 +1045,19 @@ struct PlannerHandler {
             pathMsg.header = dimos::make_header("vehicle", odomTime);
             lcm->publish(topic_path, &pathMsg);
         }
+
+        // Publish the robot's actual velocity so downstream modules
+        // (e.g. PathFollower) can account for momentum.
+        if (!topic_effective_cmd_vel.empty()) {
+            geometry_msgs::Twist vel;
+            vel.linear.x = effectiveVelX;
+            vel.linear.y = effectiveVelY;
+            vel.linear.z = 0;
+            vel.angular.x = 0;
+            vel.angular.y = 0;
+            vel.angular.z = effectiveYawRate;
+            lcm->publish(topic_effective_cmd_vel, &vel);
+        }
     }
 };
 
@@ -1173,6 +1201,7 @@ int main(int argc, char** argv) {
     handler.topic_free_paths = opt_topic("free_paths");
     handler.topic_slow_down = opt_topic("slow_down");
     handler.topic_goal_reached = opt_topic("goal_reached");
+    handler.topic_effective_cmd_vel = opt_topic("effective_cmd_vel");
 
     opt_sub(topic_joy, &PlannerHandler::onJoyCmd);
     opt_sub(topic_goal_pose, &PlannerHandler::onGoalPose);
