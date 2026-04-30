@@ -143,6 +143,14 @@ struct LocalPlannerConfig {
     // Publish free_paths visualization cloud.  Disabled saves CPU
     // (iterates 343×36 candidates and builds a PointCloud2 each cycle).
     bool publishFreePaths = true;
+
+    // Momentum penalty: biases path selection toward continuing current motion.
+    // 0.0 = disabled (default, identical to original behavior).
+    // Higher values penalize paths that require large direction changes at speed.
+    // Penalty = (angleDiff/180)² × (effectiveSpeed/maxSpeed) × maxMomentumPenalty
+    // Applied per-path as: score *= max(0, 1 - penalty).
+    // Collision-blocked paths are still eliminated regardless of this setting.
+    double maxMomentumPenalty = 0.0;
 };
 
 // ─── Path data constants ────────────────────────────────────────────────────
@@ -869,6 +877,14 @@ struct PlannerHandler {
             if (minObsAngCW > 0) minObsAngCW = 0;
             if (minObsAngCCW < 0) minObsAngCCW = 0;
 
+            // Momentum penalty: precompute current motion direction and speed ratio.
+            float effectiveSpeed = std::sqrt(effectiveVelX * effectiveVelX +
+                                             effectiveVelY * effectiveVelY);
+            float speedRatio = (config.maxSpeed > 0)
+                ? std::min(effectiveSpeed / (float)config.maxSpeed, 1.0f)
+                : 0.0f;
+            float motionDir = std::atan2(effectiveVelY, effectiveVelX) * 180.0f / (float)PI;
+
             // Score paths
             for (int i = 0; i < 36 * PATH_NUM; i++) {
                 int rotDir = i / PATH_NUM;
@@ -900,6 +916,20 @@ struct PlannerHandler {
                         score = (1.0f - std::sqrt(std::sqrt((float)config.dirWeight * dirDiff))) *
                                 groupDirW * groupDirW;
                     }
+
+                    // Momentum penalty: penalize paths diverging from current motion.
+                    // At rest (speedRatio≈0) → penalty≈0, no cold start issue.
+                    if (score > 0 && config.maxMomentumPenalty > 0 && speedRatio > 0) {
+                        float pathDir = endDirPathList[i % PATH_NUM] + (10.0f * rotDir - 180.0f);
+                        float momentumAngDiff = std::fabs(motionDir - pathDir);
+                        if (momentumAngDiff > 360.0f) momentumAngDiff -= 360.0f;
+                        if (momentumAngDiff > 180.0f) momentumAngDiff = 360.0f - momentumAngDiff;
+                        float normAng = momentumAngDiff / 180.0f;
+                        float penalty = normAng * normAng * speedRatio
+                                        * (float)config.maxMomentumPenalty;
+                        score *= std::max(0.0f, 1.0f - penalty);
+                    }
+
                     if (score > 0) {
                         clearPathPerGroupScore[GROUP_NUM * rotDir + pathList[i % PATH_NUM]] += score;
                         clearPathPerGroupNum[GROUP_NUM * rotDir + pathList[i % PATH_NUM]]++;
@@ -1119,6 +1149,7 @@ int main(int argc, char** argv) {
     config.goalX                = mod.arg_float("goalX", 0.0f);
     config.goalY                = mod.arg_float("goalY", 0.0f);
     config.publishFreePaths     = std::string(mod.arg("publishFreePaths", "true")) == "true";
+    config.maxMomentumPenalty   = mod.arg_float("maxMomentumPenalty", 0.0f);
 
     if (config.pathFolder.empty()) {
         config.pathFolder = defaultBundledPathsDir();
@@ -1133,9 +1164,10 @@ int main(int argc, char** argv) {
     }
 
     printf("[LocalPlanner] Config: pathFolder=%s adjacentRange=%.1f maxSpeed=%.1f "
-           "useTerrainAnalysis=%d autonomyMode=%d pathScale=%.2f\n",
+           "useTerrainAnalysis=%d autonomyMode=%d pathScale=%.2f maxMomentumPenalty=%.2f\n",
            config.pathFolder.c_str(), config.adjacentRange, config.maxSpeed,
-           config.useTerrainAnalysis, config.autonomyMode, config.pathScale);
+           config.useTerrainAnalysis, config.autonomyMode, config.pathScale,
+           config.maxMomentumPenalty);
 
     // Load path data
     printf("[LocalPlanner] Reading path files...\n");
