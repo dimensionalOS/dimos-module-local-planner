@@ -359,6 +359,9 @@ struct PlannerHandler {
     std::string topic_slow_down;
     std::string topic_goal_reached;
 
+    // Frame the planner publishes its path/free_paths in (robot body frame).
+    std::string body_frame = "vehicle";
+
     // Path data
     std::vector<PointXYZ> startPaths[GROUP_NUM];
     std::vector<smartnav::PointXYZI> paths[PATH_NUM];  // for free_paths viz [ROS: localPlanner.cpp:137]
@@ -1010,7 +1013,7 @@ struct PlannerHandler {
 
                 if (!pathMsg.poses.empty()) {
                     pathMsg.poses_length = (int32_t)pathMsg.poses.size();
-                    pathMsg.header = dimos::make_header("vehicle", odomTime);
+                    pathMsg.header = dimos::make_header(body_frame, odomTime);
                     lcm->publish(topic_path, &pathMsg);
                 }
 
@@ -1042,7 +1045,7 @@ struct PlannerHandler {
                             }
                         }
                     }
-                    auto freeMsg = smartnav::build_pointcloud2(freePoints, "vehicle", odomTime);
+                    auto freeMsg = smartnav::build_pointcloud2(freePoints, body_frame, odomTime);
                     lcm->publish(topic_free_paths, &freeMsg);
                 }
 
@@ -1072,7 +1075,7 @@ struct PlannerHandler {
             pose.pose.orientation.w = 0;
             pathMsg.poses.push_back(pose);
             pathMsg.poses_length = 1;
-            pathMsg.header = dimos::make_header("vehicle", odomTime);
+            pathMsg.header = dimos::make_header(body_frame, odomTime);
             lcm->publish(topic_path, &pathMsg);
         }
 
@@ -1174,6 +1177,7 @@ int main(int argc, char** argv) {
 
     PlannerHandler handler;
     handler.config = config;
+    handler.body_frame = mod.arg("body_frame", "vehicle");
 
     readStartPaths(config.pathFolder, handler.startPaths);
     if (config.publishFreePaths) {
