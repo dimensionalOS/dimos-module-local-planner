@@ -1264,6 +1264,12 @@ int main(int argc, char** argv) {
     if (!handler.topic_slow_down.empty()) printf("  slow_down=%s\n", handler.topic_slow_down.c_str());
     if (!handler.topic_goal_reached.empty()) printf("  goal_reached=%s\n", handler.topic_goal_reached.c_str());
 
+    // NativeModule.start() in Python reads stderr for this marker and only
+    // returns once it sees it. Without this, upstream publishers can race
+    // ahead and emit messages before our LCM subscriptions are live.
+    fprintf(stderr, "[DIMOS_NATIVE_READY]\n");
+    fflush(stderr);
+
     // Main loop at 100Hz (matching ROS original)
     auto loop_period = std::chrono::milliseconds(10);
     while (g_running) {
