@@ -140,6 +140,11 @@ struct LocalPlannerConfig {
     double goalYawThreshold = 0.15;
     double goalX = 0;
     double goalY = 0;
+    // Look-ahead distance (m) along an incoming global_path. The planner picks its
+    // own waypoint by sliding this far ahead of the vehicle along the path, so it
+    // does not depend on an external waypoint publisher. Clamps to the path end as
+    // the vehicle approaches the goal.
+    double pathFollowLookahead = 3.0;
     // Publish free_paths visualization cloud.  Disabled saves CPU
     // (iterates 343×36 candidates and builds a PointCloud2 each cycle).
     bool publishFreePaths = true;
@@ -395,6 +400,11 @@ struct PlannerHandler {
     bool hasGoalYaw = false;
     bool goalReached = false;
 
+    // Incoming global path (world frame). When present, the planner selects its own
+    // waypoint by sliding pathFollowLookahead ahead along it (see planOnce).
+    std::vector<std::pair<float, float>> navPath;
+    bool hasNavPath = false;
+
     // Obstacle clouds
     std::vector<smartnav::PointXYZI> laserCloudDwz;
     std::vector<smartnav::PointXYZI> terrainCloudDwz;
@@ -492,6 +502,21 @@ struct PlannerHandler {
         goalReached = false;
         goalX = msg->point.x;
         goalY = msg->point.y;
+    }
+
+    // Global path from the far planner. The planner reads the whole path and picks
+    // its own waypoint internally (planOnce), advancing as the vehicle progresses.
+    void onPath(const lcm::ReceiveBuffer*, const std::string&,
+                const nav_msgs::Path* msg) {
+        std::lock_guard<std::mutex> lock(mtx);
+        navPath.clear();
+        navPath.reserve(msg->poses_length);
+        for (int i = 0; i < msg->poses_length; i++) {
+            navPath.emplace_back((float)msg->poses[i].pose.position.x,
+                                 (float)msg->poses[i].pose.position.y);
+        }
+        hasNavPath = !navPath.empty();
+        if (hasNavPath) goalReached = false;
     }
 
     void onJoyCmd(const lcm::ReceiveBuffer*, const std::string&,
@@ -707,6 +732,29 @@ struct PlannerHandler {
         float relativeGoalDis = (float)config.adjacentRange;
 
         float localJoyDir = joyDir;
+
+        // Pick our own waypoint from the global path: slide pathFollowLookahead ahead
+        // of the vehicle along the path. Clamps to the last point near the goal, so the
+        // planner naturally advances through waypoints without an external publisher.
+        if (hasNavPath && !navPath.empty()) {
+            int nearest = 0;
+            float nearestD2 = 1e18f;
+            for (size_t i = 0; i < navPath.size(); i++) {
+                float dx = navPath[i].first - vehicleX;
+                float dy = navPath[i].second - vehicleY;
+                float d2 = dx * dx + dy * dy;
+                if (d2 < nearestD2) { nearestD2 = d2; nearest = (int)i; }
+            }
+            float lookSq = (float)(config.pathFollowLookahead * config.pathFollowLookahead);
+            int target = (int)navPath.size() - 1;
+            for (size_t i = nearest; i < navPath.size(); i++) {
+                float dx = navPath[i].first - vehicleX;
+                float dy = navPath[i].second - vehicleY;
+                if (dx * dx + dy * dy >= lookSq) { target = (int)i; break; }
+            }
+            goalX = navPath[target].first;
+            goalY = navPath[target].second;
+        }
 
         int preSelectedGroupID = -1;
         if (config.autonomyMode) {
@@ -1151,6 +1199,7 @@ int main(int argc, char** argv) {
     config.goalYawThreshold     = mod.arg_float("goalYawThreshold", 0.15f);
     config.goalX                = mod.arg_float("goalX", 0.0f);
     config.goalY                = mod.arg_float("goalY", 0.0f);
+    config.pathFollowLookahead  = mod.arg_float("pathFollowLookahead", 3.0f);
     config.publishFreePaths     = std::string(mod.arg("publishFreePaths", "true")) == "true";
     config.maxMomentumPenalty   = mod.arg_float("maxMomentumPenalty", 0.0f);
 
@@ -1219,14 +1268,17 @@ int main(int argc, char** argv) {
     std::string topic_scan = mod.topic("registered_scan");
     std::string topic_odom = mod.topic("odometry");
     std::string topic_terrain = mod.topic("terrain_map");
-    std::string topic_waypoint = mod.topic("way_point");
 
     lcm.subscribe(topic_odom, &PlannerHandler::onOdometry, &handler);
     lcm.subscribe(topic_scan, &PlannerHandler::onRegisteredScan, &handler);
     lcm.subscribe(topic_terrain, &PlannerHandler::onTerrainMap, &handler);
-    lcm.subscribe(topic_waypoint, &PlannerHandler::onWayPoint, &handler);
 
     // Optional ports (connected only when another module provides/consumes them)
+    // global_path drives the planner now: it picks its own waypoint along the path.
+    std::string topic_global_path = opt_topic("global_path");
+    // way_point / goal_pose are legacy single-target inputs (kept optional for the
+    // standalone rosbag accuracy test); the blueprint no longer connects them.
+    std::string topic_waypoint = opt_topic("way_point");
     std::string topic_joy = opt_topic("joy_cmd");
     std::string topic_goal_pose = opt_topic("goal_pose");
     std::string topic_speed = opt_topic("speed");
@@ -1239,6 +1291,8 @@ int main(int argc, char** argv) {
     handler.topic_goal_reached = opt_topic("goal_reached");
     handler.topic_effective_cmd_vel = opt_topic("effective_cmd_vel");
 
+    opt_sub(topic_global_path, &PlannerHandler::onPath);
+    opt_sub(topic_waypoint, &PlannerHandler::onWayPoint);
     opt_sub(topic_joy, &PlannerHandler::onJoyCmd);
     opt_sub(topic_goal_pose, &PlannerHandler::onGoalPose);
     opt_sub(topic_speed, &PlannerHandler::onSpeed);
@@ -1248,10 +1302,10 @@ int main(int argc, char** argv) {
     opt_sub(topic_cancel, &PlannerHandler::onCancelGoal);
 
     printf("[LocalPlanner] Subscriptions:\n"
-           "  registered_scan=%s\n  odometry=%s\n  terrain_map=%s\n"
-           "  way_point=%s\n",
-           topic_scan.c_str(), topic_odom.c_str(), topic_terrain.c_str(),
-           topic_waypoint.c_str());
+           "  registered_scan=%s\n  odometry=%s\n  terrain_map=%s\n",
+           topic_scan.c_str(), topic_odom.c_str(), topic_terrain.c_str());
+    if (!topic_global_path.empty()) printf("  global_path=%s\n", topic_global_path.c_str());
+    if (!topic_waypoint.empty()) printf("  way_point=%s\n", topic_waypoint.c_str());
     if (!topic_joy.empty()) printf("  joy_cmd=%s\n", topic_joy.c_str());
     if (!topic_goal_pose.empty()) printf("  goal_pose=%s\n", topic_goal_pose.c_str());
     if (!topic_speed.empty()) printf("  speed=%s\n", topic_speed.c_str());
