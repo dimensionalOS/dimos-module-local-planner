@@ -366,6 +366,15 @@ struct PlannerHandler {
 
     // Frame the planner publishes its path/free_paths in (robot body frame).
     std::string body_frame = "vehicle";
+    // Expected incoming frames (frame_mapping common-name -> real id). registered_scan must arrive
+    // in sensor_frame (vehicle-relative), terrain_map / odometry / global_path in world_frame.
+    // Mismatched frame_ids are warned about (once each) — we do NOT yet do a real TF lookup.
+    std::string world_frame = "map";
+    std::string sensor_frame = "sensor";
+    bool warnedScanFrame = false;
+    bool warnedTerrainFrame = false;
+    bool warnedOdomFrame = false;
+    bool warnedPathFrame = false;
 
     // Path data
     std::vector<PointXYZ> startPaths[GROUP_NUM];
@@ -420,6 +429,11 @@ struct PlannerHandler {
     void onOdometry(const lcm::ReceiveBuffer*, const std::string&,
                     const nav_msgs::Odometry* msg) {
         std::lock_guard<std::mutex> lock(mtx);
+        if (msg->header.frame_id != world_frame && !warnedOdomFrame) {
+            printf("[LocalPlanner] WARN odometry frame_id='%s' != world_frame='%s'\n",
+                   msg->header.frame_id.c_str(), world_frame.c_str());
+            warnedOdomFrame = true;
+        }
         odomTime = msg->header.stamp.sec + msg->header.stamp.nsec / 1e9;
 
         double roll, pitch, yaw;
@@ -450,20 +464,39 @@ struct PlannerHandler {
 
     void onRegisteredScan(const lcm::ReceiveBuffer*, const std::string&,
                           const sensor_msgs::PointCloud2* msg) {
-        if (config.useTerrainAnalysis) return;
         std::lock_guard<std::mutex> lock(mtx);
 
-        auto points = smartnav::parse_pointcloud2(*msg);
+        // Expected sensor_frame (vehicle-relative). If it arrives in world_frame instead (the OG
+        // "registered_scan" convention), use it as-is; warn on any other frame_id.
+        const std::string& fid = msg->header.frame_id;
+        bool isSensor = (fid == sensor_frame);
+        if (!isSensor && fid != world_frame && !warnedScanFrame) {
+            printf("[LocalPlanner] WARN registered_scan frame_id='%s' is neither sensor_frame='%s' "
+                   "nor world_frame='%s'; assuming sensor frame\n",
+                   fid.c_str(), sensor_frame.c_str(), world_frame.c_str());
+            warnedScanFrame = true;
+            isSensor = true;
+        }
 
-        // Crop to adjacent range
+        auto points = smartnav::parse_pointcloud2(*msg);
+        float sinYaw = std::sin(vehicleYaw);
+        float cosYaw = std::cos(vehicleYaw);
+
+        // Crop to adjacent range, converting sensor-frame points to world frame so the rest of the
+        // pipeline (planOnce) can apply its single world->vehicle transform uniformly.
         std::vector<smartnav::PointXYZI> cropped;
         cropped.reserve(points.size());
         for (auto& p : points) {
-            float dx = p.x - vehicleX;
-            float dy = p.y - vehicleY;
-            float dis = std::sqrt(dx * dx + dy * dy);
-            if (dis < config.adjacentRange) {
-                cropped.push_back(p);
+            smartnav::PointXYZI w = p;
+            if (isSensor) {
+                w.x = vehicleX + (cosYaw * p.x - sinYaw * p.y);
+                w.y = vehicleY + (sinYaw * p.x + cosYaw * p.y);
+                w.z = vehicleZ + p.z;
+            }
+            float dx = w.x - vehicleX;
+            float dy = w.y - vehicleY;
+            if (std::sqrt(dx * dx + dy * dy) < config.adjacentRange) {
+                cropped.push_back(w);
             }
         }
 
@@ -473,8 +506,16 @@ struct PlannerHandler {
 
     void onTerrainMap(const lcm::ReceiveBuffer*, const std::string&,
                       const sensor_msgs::PointCloud2* msg) {
-        if (!config.useTerrainAnalysis) return;
         std::lock_guard<std::mutex> lock(mtx);
+
+        // Terrain map is expected in world_frame (already registered). Warn if not.
+        const std::string& fid = msg->header.frame_id;
+        if (fid != world_frame && !warnedTerrainFrame) {
+            printf("[LocalPlanner] WARN terrain_map frame_id='%s' != world_frame='%s'; "
+                   "assuming world frame\n",
+                   fid.c_str(), world_frame.c_str());
+            warnedTerrainFrame = true;
+        }
 
         auto points = smartnav::parse_pointcloud2(*msg);
 
@@ -509,6 +550,11 @@ struct PlannerHandler {
     void onPath(const lcm::ReceiveBuffer*, const std::string&,
                 const nav_msgs::Path* msg) {
         std::lock_guard<std::mutex> lock(mtx);
+        if (msg->header.frame_id != world_frame && !warnedPathFrame) {
+            printf("[LocalPlanner] WARN global_path frame_id='%s' != world_frame='%s'\n",
+                   msg->header.frame_id.c_str(), world_frame.c_str());
+            warnedPathFrame = true;
+        }
         navPath.clear();
         navPath.reserve(msg->poses_length);
         for (int i = 0; i < msg->poses_length; i++) {
@@ -660,16 +706,15 @@ struct PlannerHandler {
         if (!newLaserCloud && !newTerrainCloud) return;
         if (!hasOdom) return;
 
-        // Select obstacle source
+        // Use BOTH obstacle sources together (lidar is fast/dense, terrain is slow/analyzed).
+        // Both are stored in world frame (registered_scan is converted in its handler), so the
+        // single world->vehicle transform below applies uniformly.
+        newLaserCloud = false;
+        newTerrainCloud = false;
         std::vector<smartnav::PointXYZI> plannerCloud;
-        if (newLaserCloud) {
-            newLaserCloud = false;
-            plannerCloud = laserCloudDwz;
-        }
-        if (newTerrainCloud) {
-            newTerrainCloud = false;
-            plannerCloud = terrainCloudDwz;
-        }
+        plannerCloud.reserve(laserCloudDwz.size() + terrainCloudDwz.size());
+        plannerCloud.insert(plannerCloud.end(), laserCloudDwz.begin(), laserCloudDwz.end());
+        plannerCloud.insert(plannerCloud.end(), terrainCloudDwz.begin(), terrainCloudDwz.end());
 
         float sinYaw = std::sin(vehicleYaw);
         float cosYaw = std::cos(vehicleYaw);
@@ -1227,6 +1272,8 @@ int main(int argc, char** argv) {
     PlannerHandler handler;
     handler.config = config;
     handler.body_frame = mod.arg("body_frame", "vehicle");
+    handler.world_frame = mod.arg("world_frame", "map");
+    handler.sensor_frame = mod.arg("sensor_frame", "sensor");
 
     readStartPaths(config.pathFolder, handler.startPaths);
     if (config.publishFreePaths) {
